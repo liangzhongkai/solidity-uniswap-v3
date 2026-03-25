@@ -16,29 +16,44 @@ struct Slot0 {
 }
 
 contract CLAMM {
-    address public immutable token0;
-    address public immutable token1;
+    address private immutable TOKEN0;
+    address private immutable TOKEN1;
     // 0.1% = 1000
-    uint24 public immutable fee;
-    int24 public immutable tickSpacing;
-    uint128 public immutable maxLiquidityPerTick;
+    uint24 private immutable FEE;
+    int24 private immutable TICK_SPACING;
+    uint128 private immutable MAX_LIQUIDITY_PER_TICK;
 
     Slot0 public slot0;
 
-    constructor(
-        address _token0,
-        address _token1,
-        uint24 _fee,
-        int24 _tickSpacing
-    ) {
+    constructor(address _token0, address _token1, uint24 _fee, int24 _tickSpacing) {
         require(_token0 != address(0), "token 0 = zero address");
         require(_token0 < _token1, "token 0 >= token 1");
 
-        token0 = _token0;
-        token1 = _token1;
-        fee = _fee;
-        tickSpacing = _tickSpacing;
-        maxLiquidityPerTick = Tick.tickSpacingToMaxLiquidityPerTick(tickSpacing);
+        TOKEN0 = _token0;
+        TOKEN1 = _token1;
+        FEE = _fee;
+        TICK_SPACING = _tickSpacing;
+        MAX_LIQUIDITY_PER_TICK = Tick.tickSpacingToMaxLiquidityPerTick(TICK_SPACING);
+    }
+
+    function token0() external view returns (address) {
+        return TOKEN0;
+    }
+
+    function token1() external view returns (address) {
+        return TOKEN1;
+    }
+
+    function fee() external view returns (uint24) {
+        return FEE;
+    }
+
+    function tickSpacing() external view returns (int24) {
+        return TICK_SPACING;
+    }
+
+    function maxLiquidityPerTick() external view returns (uint128) {
+        return MAX_LIQUIDITY_PER_TICK;
     }
 
     function initialize(uint160 sqrtPriceX96) external {
@@ -46,6 +61,4 @@ contract CLAMM {
         int24 tick = TickMath.getTickAtSqrtRatio(sqrtPriceX96);
         slot0 = Slot0({sqrtPriceX96: sqrtPriceX96, tick: tick, unlocked: true});
     }
-
-    
 }
