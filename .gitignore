@@ -1,0 +1,40 @@
+# Compiler files
+cache/
+out/
+
+# Soldeer (Foundry) vendored deps — keep remappings / lock; ignore unpacked tree if used
+dependencies/
+
+# Ignores development broadcast logs
+!/broadcast
+/broadcast/*/31337/
+/broadcast/**/dry-run/
+
+# Docs
+docs/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Coverage (forge coverage, etc.)
+lcov.info
+coverage/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node (frontend, tooling)
+node_modules/
