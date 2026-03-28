@@ -44,5 +44,40 @@ library SafeCast {
         require(mag <= uint256(type(uint128).max));
         z = uint128(mag);
     }
+
+    /// @notice Cast uint256 to uint128; reverts on overflow
+    function toUint128(uint256 y) internal pure returns (uint128 z) {
+        require((z = uint128(y)) == y);
+    }
+
+    /// @notice Cast non-negative int256 to uint256
+    function toUint256(int256 y) internal pure returns (uint256 z) {
+        require(y >= 0);
+        unchecked {
+            z = uint256(y);
+        }
+    }
+
+    /// @notice Magnitude of non-positive int256 as uint256
+    function negToUint256(int256 y) internal pure returns (uint256 z) {
+        require(y <= 0);
+        unchecked {
+            z = uint256(-y);
+        }
+    }
+
+    /// @notice Cast non-negative int128 to uint128
+    function toUint128(int128 y) internal pure returns (uint128 z) {
+        require(y >= 0);
+        unchecked {
+            z = uint128(uint256(int256(y)));
+        }
+    }
+
+    /// @notice Word and bit index for tick bitmap (matches Uniswap V3 TickBitmap.position)
+    function tickBitmapPosition(int24 tick) internal pure returns (int16 wordPos, uint8 bitPos) {
+        wordPos = int16(tick >> 8);
+        bitPos = uint8(uint24(tick % 256));
+    }
 }
 // forge-lint: disable-end(unsafe-typecast)

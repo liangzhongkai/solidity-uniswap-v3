@@ -7,6 +7,10 @@ import {Position} from "./lib/Position.sol";
 import {IERC20} from "./interfaces/IERC20.sol";
 import {SafeCast} from "./lib/SafeCast.sol";
 import {SqrtPriceMath} from "./lib/SqrtPriceMath.sol";
+import {SwapMath} from "./lib/SwapMath.sol";
+import {FullMath} from "./lib/FullMath.sol";
+import {FixedPoint128} from "./lib/FixedPoint128.sol";
+import {TickBitmap} from "./lib/TickBitmap.sol";
 
 // slot 0 = 32 bytes
 // 2**256 = 32 bytes
@@ -31,6 +35,8 @@ contract CLAMM {
     using Position for mapping(bytes32 => Position.Info); // for get()
     using Position for Position.Info; // for update()
     using Tick for mapping(int24 => Tick.Info); // for update() and clear()
+    using Tick for Tick.Info; // for cross()
+    using TickBitmap for mapping(int16 => uint256); // for nextInitializedTickWithinOneWord()
 
     address private immutable TOKEN0;
     address private immutable TOKEN1;
@@ -40,11 +46,12 @@ contract CLAMM {
     uint128 private immutable MAX_LIQUIDITY_PER_TICK;
 
     Slot0 public slot0;
-    mapping(bytes32 => Position.Info) public positions;
+    uint128 public currentLiquidity;
     uint256 public feeGrowthGlobal0X128;
     uint256 public feeGrowthGlobal1X128;
     mapping(int24 => Tick.Info) public ticks;
-    uint128 public currentLiquidity;
+    mapping(int16 => uint256) public tickBitmap;
+    mapping(bytes32 => Position.Info) public positions;
 
     struct ModifyPositionParams {
         address owner;
@@ -135,6 +142,13 @@ contract CLAMM {
                 true,
                 MAX_LIQUIDITY_PER_TICK
             );
+
+            if (flippedLower) {
+                tickBitmap.flipTick(tickLower, TICK_SPACING);
+            }
+            if (flippedUpper) {
+                tickBitmap.flipTick(tickUpper, TICK_SPACING);
+            }
         }
 
         (uint256 feeGrowthInside0X128, uint256 feeGrowthInside1X128) =
@@ -185,8 +199,8 @@ contract CLAMM {
                 );
 
                 currentLiquidity = params.liquidityDelta < 0
-                    ? currentLiquidity - uint128(-params.liquidityDelta)
-                    : currentLiquidity + uint128(params.liquidityDelta);
+                    ? currentLiquidity - SafeCast.absAsUint128(params.liquidityDelta)
+                    : currentLiquidity + SafeCast.toUint128(params.liquidityDelta);
             } else {
                 // Calculate amount 1
                 amount1 = SqrtPriceMath.getAmount1Delta(
@@ -217,10 +231,8 @@ contract CLAMM {
             })
         );
 
-        // forge-lint: disable-next-line(unsafe-typecast)
-        amount0 = uint256(amount0Int);
-        // forge-lint: disable-next-line(unsafe-typecast)
-        amount1 = uint256(amount1Int);
+        amount0 = amount0Int.toUint256();
+        amount1 = amount1Int.toUint256();
 
         if (amount0 > 0) {
             require(IERC20(TOKEN0).transferFrom(msg.sender, address(this), amount0), "transfer0 failed");
@@ -248,11 +260,11 @@ contract CLAMM {
 
         if (amount0 > 0) {
             position.tokensOwed0 -= amount0;
-            IERC20(TOKEN0).transfer(recipient, amount0);
+            require(IERC20(TOKEN0).transfer(recipient, amount0), "transfer0 failed");
         }
         if (amount1 > 0) {
             position.tokensOwed1 -= amount1;
-            IERC20(TOKEN1).transfer(recipient, amount1);
+            require(IERC20(TOKEN1).transfer(recipient, amount1), "transfer1 failed");
         }
     }
 
@@ -270,16 +282,213 @@ contract CLAMM {
             })
         );
 
-        amount0 = uint256(-amount0Int);
-        amount1 = uint256(-amount1Int);
+        amount0 = amount0Int.negToUint256();
+        amount1 = amount1Int.negToUint256();
 
         if (amount0 > 0) {
-            position.tokensOwed0 = position.tokensOwed0 + uint128(amount0);
+            position.tokensOwed0 = position.tokensOwed0 + amount0.toUint128();
             // IERC20(TOKEN0).transfer(msg.sender, amount0); todo
         }
         if (amount1 > 0) {
-            position.tokensOwed1 = position.tokensOwed1 + uint128(amount1);
+            position.tokensOwed1 = position.tokensOwed1 + amount1.toUint128();
             // IERC20(TOKEN1).transfer(msg.sender, amount1); todo
+        }
+    }
+
+    struct SwapCache {
+        uint128 liquidityStart;
+    }
+
+    struct SwapState {
+        int256 amountSpecifiedRemaining;
+        // amount already swapped out/in of the output/input asset
+        int256 amountCalculated;
+        uint160 sqrtPriceX96;
+        int24 tick;
+        // fee growth on input token
+        uint256 feeGrowthGlobalX128;
+        // current liquidity in range
+        uint128 liquidity;
+    }
+
+    struct StepComputations {
+        uint160 sqrtPriceStartX96;
+        int24 tickNext;
+        // whether tickNext is initialized or not
+        bool initialized;
+        uint160 sqrtPriceNextX96;
+        // how much is being swapped in in this step
+        uint256 amountIn;
+        // how much is being swapped out
+        uint256 amountOut;
+        // how much fee is being paid in
+        uint256 feeAmount;
+    }
+
+    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96)
+        external
+        lock
+        returns (int256 amount0, int256 amount1)
+    {
+        require(amountSpecified != 0);
+
+        Slot0 memory slot0Start = slot0;
+
+        // token 1 | token 0
+        // --------|---------
+        //        tick
+        // <-- zero for one
+        require(
+            zeroForOne
+                ? sqrtPriceLimitX96 < slot0Start.sqrtPriceX96 && sqrtPriceLimitX96 > TickMath.MIN_SQRT_RATIO
+                : sqrtPriceLimitX96 > slot0Start.sqrtPriceX96 && sqrtPriceLimitX96 < TickMath.MAX_SQRT_RATIO,
+            "invalid sqrt price limit"
+        );
+
+        SwapCache memory cache = SwapCache({liquidityStart: currentLiquidity});
+
+        // true = sell some specified amount of token in
+        // false = buy some specified amount of token out
+        bool exactInput = amountSpecified > 0;
+
+        SwapState memory state = SwapState({
+            amountSpecifiedRemaining: amountSpecified,
+            amountCalculated: 0,
+            sqrtPriceX96: slot0Start.sqrtPriceX96,
+            tick: slot0Start.tick,
+            // Fee on token in
+            feeGrowthGlobalX128: zeroForOne ? feeGrowthGlobal0X128 : feeGrowthGlobal1X128,
+            liquidity: cache.liquidityStart
+        });
+
+        while (state.amountSpecifiedRemaining != 0 && state.sqrtPriceX96 != sqrtPriceLimitX96) {
+            StepComputations memory step;
+
+            step.sqrtPriceStartX96 = state.sqrtPriceX96;
+
+            // Get next tick
+            (step.tickNext, step.initialized) = tickBitmap.nextInitializedTickWithinOneWord(
+                state.tick,
+                TICK_SPACING,
+                // zero for one --> price decreases --> lte
+                // one for zero --> price increases --> gt
+                zeroForOne
+            );
+
+            // Bound tick next
+            if (step.tickNext < TickMath.MIN_TICK) {
+                step.tickNext = TickMath.MIN_TICK;
+            } else if (step.tickNext > TickMath.MAX_TICK) {
+                step.tickNext = TickMath.MAX_TICK;
+            }
+
+            step.sqrtPriceNextX96 = TickMath.getSqrtRatioAtTick(step.tickNext);
+
+            (state.sqrtPriceX96, step.amountIn, step.amountOut, step.feeAmount) = SwapMath.computeSwapStep(
+                state.sqrtPriceX96,
+                // zero for one --> max(next, limit)
+                // one for zero --> min(next, limit)
+                (zeroForOne ? step.sqrtPriceNextX96 < sqrtPriceLimitX96 : step.sqrtPriceNextX96 > sqrtPriceLimitX96)
+                    ? sqrtPriceLimitX96
+                    : step.sqrtPriceNextX96,
+                state.liquidity,
+                state.amountSpecifiedRemaining,
+                FEE
+            );
+
+            if (exactInput) {
+                // Decreases to 0
+                state.amountSpecifiedRemaining -= (step.amountIn + step.feeAmount).toInt256();
+                state.amountCalculated -= step.amountOut.toInt256();
+            } else {
+                // Increases to 0
+                state.amountSpecifiedRemaining += step.amountOut.toInt256();
+                state.amountCalculated += (step.amountIn + step.feeAmount).toInt256();
+            }
+
+            if (state.liquidity > 0) {
+                // fee growth += fee amount * (1 << 128) / liquidity
+                state.feeGrowthGlobalX128 += FullMath.mulDiv(step.feeAmount, FixedPoint128.Q128, state.liquidity);
+            }
+
+            // shift tick if we reached the next price
+            if (state.sqrtPriceX96 == step.sqrtPriceNextX96) {
+                if (step.initialized) {
+                    int128 liquidityNet = ticks.cross(
+                        step.tickNext,
+                        zeroForOne ? state.feeGrowthGlobalX128 : feeGrowthGlobal0X128,
+                        zeroForOne ? feeGrowthGlobal1X128 : state.feeGrowthGlobalX128
+                    );
+
+                    if (zeroForOne) {
+                        liquidityNet = -liquidityNet;
+                    }
+
+                    state.liquidity = liquidityNet < 0
+                        ? state.liquidity - SafeCast.absAsUint128(liquidityNet)
+                        : state.liquidity + SafeCast.toUint128(liquidityNet);
+                }
+                // zeroForOne = true --> tickNext <= state.tick
+                // if tickNext = state.tick --> nextInitializedTick = tickNext, so -1 to get next tick
+                // if tickNext < state.tick --> nextInitializedTick = tickNext, so -1 to get next tick
+                state.tick = zeroForOne ? step.tickNext - 1 : step.tickNext;
+            } else if (state.sqrtPriceX96 != step.sqrtPriceStartX96) {
+                // state.sqrtPriceX96 is still in between 2 initialized ticks
+                // Recompute tick
+                state.tick = TickMath.getTickAtSqrtRatio(state.sqrtPriceX96);
+            }
+        }
+
+        // Update sqrtPriceX96 and tick
+        if (state.tick != slot0Start.tick) {
+            (slot0.sqrtPriceX96, slot0.tick) = (state.sqrtPriceX96, state.tick);
+        } else {
+            slot0.sqrtPriceX96 = state.sqrtPriceX96;
+        }
+
+        // Update currentLiquidity
+        if (cache.liquidityStart != state.liquidity) {
+            currentLiquidity = state.liquidity;
+        }
+
+        // Update fee growth
+        if (zeroForOne) {
+            feeGrowthGlobal0X128 = state.feeGrowthGlobalX128;
+        } else {
+            feeGrowthGlobal1X128 = state.feeGrowthGlobalX128;
+        }
+
+        // Set amount0 and amount1
+        // zero for one | exact input |
+        //    true      |    true     | amount 0 = specified - remaining (> 0)
+        //              |             | amount 1 = calculated            (< 0)
+        //    false     |    false    | amount 0 = specified - remaining (< 0)
+        //              |             | amount 1 = calculated            (> 0)
+        //    false     |    true     | amount 0 = calculated            (< 0)
+        //              |             | amount 1 = specified - remaining (> 0)
+        //    true      |    false    | amount 0 = calculated            (> 0)
+        //              |             | amount 1 = specified - remaining (< 0)
+        (amount0, amount1) = zeroForOne == exactInput
+            ? (amountSpecified - state.amountSpecifiedRemaining, state.amountCalculated)
+            : (state.amountCalculated, amountSpecified - state.amountSpecifiedRemaining);
+
+        // Transfer tokens
+        if (zeroForOne) {
+            if (amount1 < 0) {
+                require(IERC20(TOKEN1).transfer(recipient, amount1.negToUint256()), "transfer1 failed");
+                require(
+                    IERC20(TOKEN0).transferFrom(msg.sender, address(this), amount0.toUint256()),
+                    "transferFrom0 failed"
+                );
+            }
+        } else {
+            if (amount0 < 0) {
+                require(IERC20(TOKEN0).transfer(recipient, amount0.negToUint256()), "transfer0 failed");
+                require(
+                    IERC20(TOKEN1).transferFrom(msg.sender, address(this), amount1.toUint256()),
+                    "transferFrom1 failed"
+                );
+            }
         }
     }
 }
