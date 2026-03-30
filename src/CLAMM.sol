@@ -155,6 +155,8 @@ contract CLAMM {
             ticks.getFeeGrowthInside(tickLower, tickUpper, tick, _feeGrowthGlobal0X128, _feeGrowthGlobal1X128);
 
         position.update(liquidityDelta, feeGrowthInside0X128, feeGrowthInside1X128);
+        position.feeGrowthInside0LastX128 = feeGrowthInside0X128;
+        position.feeGrowthInside1LastX128 = feeGrowthInside1X128;
 
         // Liquidity decreased and tick was flipped = liquidity after is 0
         if (liquidityDelta < 0) {
@@ -477,16 +479,14 @@ contract CLAMM {
             if (amount1 < 0) {
                 require(IERC20(TOKEN1).transfer(recipient, amount1.negToUint256()), "transfer1 failed");
                 require(
-                    IERC20(TOKEN0).transferFrom(msg.sender, address(this), amount0.toUint256()),
-                    "transferFrom0 failed"
+                    IERC20(TOKEN0).transferFrom(msg.sender, address(this), amount0.toUint256()), "transferFrom0 failed"
                 );
             }
         } else {
             if (amount0 < 0) {
                 require(IERC20(TOKEN0).transfer(recipient, amount0.negToUint256()), "transfer0 failed");
                 require(
-                    IERC20(TOKEN1).transferFrom(msg.sender, address(this), amount1.toUint256()),
-                    "transferFrom1 failed"
+                    IERC20(TOKEN1).transferFrom(msg.sender, address(this), amount1.toUint256()), "transferFrom1 failed"
                 );
             }
         }
